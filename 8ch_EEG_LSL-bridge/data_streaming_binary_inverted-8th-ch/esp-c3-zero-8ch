@@ -1,0 +1,217 @@
+/*
+   ESP32-C3 + ADS131M08 (port of the original Arduino Uno sketch)
+   --------------------------------------------------------------
+   Register/command logic is kept exactly as in the Uno version.
+   Output packet (38 bytes, little-endian) is unchanged, so the
+   Python LSL bridge works without modification:
+
+     0xAA 0x55 | uint32 counter | 8 x int32 samples
+
+   Arduino IDE: enable "USB CDC On Boot" for the ESP32-C3-Zero.
+   Do not print debug text to Serial - the bridge expects only packets.
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+
+// ===================================================
+// ADS131M08 SETTINGS
+// ===================================================
+
+#define INPUT_MODE_DIFFERENTIAL true
+#define SAMPLE_RATE_HZ 250
+#define SPI_SPEED 1000000
+
+// ---------------------------------------------------
+// ESP32-C3-Zero pin assignment  --  CONFIRM AGAINST YOUR WIRING
+// (these are suggested pins, not taken from the Uno sketch)
+// ---------------------------------------------------
+#define SCLK_PIN   4
+#define MISO_PIN   5     // ADS131M08 DOUT
+#define MOSI_PIN   6     // ADS131M08 DIN
+#define CS_PIN     7
+#define DRDY_PIN   3
+#define RESET_PIN  1
+
+volatile bool dataReady = false;
+
+// ===================================================
+// Packet - packed so no padding bytes are inserted
+// ===================================================
+
+struct __attribute__((packed)) SamplePacket
+{
+  uint8_t  sync1;
+  uint8_t  sync2;
+  uint32_t counter;
+  int32_t  ch[8];
+};
+
+static_assert(sizeof(SamplePacket) == 38, "SamplePacket must be 38 bytes");
+
+uint32_t sampleCounter = 0;
+
+// ===================================================
+// DRDY interrupt (must live in IRAM on ESP32)
+// ===================================================
+
+void IRAM_ATTR drdyISR()
+{
+  dataReady = true;
+}
+
+// ===================================================
+// SPI helpers (unchanged from the Uno sketch)
+// ===================================================
+
+void writeRegister(uint8_t reg, uint8_t value)
+{
+  digitalWrite(CS_PIN, LOW);
+
+  SPI.transfer(0x40 | reg);
+  SPI.transfer(0x00);
+  SPI.transfer(value);
+
+  digitalWrite(CS_PIN, HIGH);
+}
+
+void sendCommand(uint8_t cmd)
+{
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(cmd);
+  digitalWrite(CS_PIN, HIGH);
+}
+
+int32_t read24()
+{
+  int32_t value = 0;
+
+  value |= ((uint32_t)SPI.transfer(0x00)) << 16;
+  value |= ((uint32_t)SPI.transfer(0x00)) << 8;
+  value |= ((uint32_t)SPI.transfer(0x00));
+
+  if (value & 0x800000)
+    value |= 0xFF000000;
+
+  return value;
+}
+
+void setDataRate(uint16_t hz)
+{
+  uint8_t dr;
+
+  switch (hz)
+  {
+    case 125: dr = 0x00; break;
+    case 250: dr = 0x04; break;
+    case 500: dr = 0x05; break;
+    default:  dr = 0x04; break;
+  }
+
+  writeRegister(0x03, dr);
+}
+
+void readAllChannels(int32_t *raw)
+{
+  // STATUS word (3 bytes, discarded)
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+
+  for (int i = 0; i < 8; i++)
+  {
+    raw[i] = read24();
+  }
+}
+
+// ===================================================
+// SETUP
+// ===================================================
+
+void setup()
+{
+  Serial.begin(500000);   // baud value is ignored by native USB CDC
+
+  pinMode(CS_PIN, OUTPUT);
+  digitalWrite(CS_PIN, HIGH);
+
+  pinMode(DRDY_PIN, INPUT_PULLUP);
+
+  pinMode(RESET_PIN, OUTPUT);
+  digitalWrite(RESET_PIN, HIGH);
+
+  // Explicit pins, so no dependence on the board's default SPI pins
+  SPI.begin(SCLK_PIN, MISO_PIN, MOSI_PIN, CS_PIN);
+
+  // ADC reset
+  digitalWrite(RESET_PIN, LOW);
+  delay(10);
+
+  digitalWrite(RESET_PIN, HIGH);
+  delay(100);
+
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+
+  uint8_t chConfig = 0x07;
+
+  if (!INPUT_MODE_DIFFERENTIAL)
+    chConfig |= 0x01;
+
+  for (uint8_t ch = 0; ch < 8; ch++)
+  {
+    writeRegister(0x05 + ch, chConfig);
+  }
+
+  setDataRate(SAMPLE_RATE_HZ);
+
+  sendCommand(0x08); // START
+
+  SPI.endTransaction();
+
+  delay(100);
+
+  // Attach the interrupt last, after SPI is fully initialised
+  attachInterrupt(digitalPinToInterrupt(DRDY_PIN), drdyISR, FALLING);
+}
+
+// ===================================================
+// MAIN LOOP
+// ===================================================
+
+void loop()
+{
+  if (!dataReady)
+    return;
+
+  dataReady = false;
+
+  int32_t raw[8];
+
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWrite(CS_PIN, LOW);
+  readAllChannels(raw);
+  digitalWrite(CS_PIN, HIGH);
+  SPI.endTransaction();
+
+  SamplePacket pkt;
+
+  pkt.sync1   = 0xAA;
+  pkt.sync2   = 0x55;
+  pkt.counter = sampleCounter++;
+
+  for (int i = 0; i < 8; i++)
+  {
+    pkt.ch[i] = raw[i];
+  }
+
+  // Polarity inversion: channel 8 only (index 7), as in the Uno sketch.
+  // Safe: values are 24-bit sign-extended, so no INT32_MIN overflow risk.
+  pkt.ch[7] = -pkt.ch[7];
+
+  // Only write if the TX buffer has room, so Serial.write() never blocks
+  // and causes missed DRDY pulses when the PC side is slow.
+  if (Serial.availableForWrite() >= (int)sizeof(pkt))
+  {
+    Serial.write((const uint8_t *)&pkt, sizeof(pkt));
+  }
+}
